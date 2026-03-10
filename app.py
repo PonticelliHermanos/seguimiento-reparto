@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +13,7 @@ DB_PATH = BASE_DIR / "repartos.db"
 
 app = Flask(__name__)
 app.secret_key = "cambiar-por-una-clave-segura"
+ADMIN_PASSWORD = "Ponticelli2026"
 
 
 # =========================
@@ -129,7 +130,7 @@ BASE_HTML = """
             color: #222;
         }
         .container {
-            max-width: 1100px;
+            max-width: 900px;
             margin: 30px auto;
             background: white;
             padding: 24px;
@@ -202,11 +203,6 @@ BASE_HTML = """
             background: #fff4d6;
             margin-bottom: 16px;
         }
-        .mini-form {
-            display: grid;
-            gap: 8px;
-            min-width: 280px;
-        }
         @media (max-width: 700px) {
             .grid-2 { grid-template-columns: 1fr; }
             .topbar { flex-direction: column; align-items: stretch; }
@@ -223,11 +219,7 @@ BASE_HTML = """
 
 
 def page(title: str, body: str, **context: object) -> str:
-    return render_template_string(
-        BASE_HTML,
-        title=title,
-        body=render_template_string(body, **context),
-    )
+    return render_template_string(BASE_HTML, title=title, body=render_template_string(body, **context))
 
 
 # =========================
@@ -272,6 +264,7 @@ def consulta_cliente() -> str:
         elif len(rows) > 1:
             multiples = rows
         else:
+            # fallback: mostrar si existe pero no va hoy
             alt = db.execute(
                 """
                 SELECT * FROM repartos
@@ -307,16 +300,14 @@ def consulta_cliente() -> str:
                 <input name="apellido" placeholder="Ej: García" required>
             </div>
             <div>
-                <label>Calle (recomendado)</label>
+                <label>Calle (recomendado para evitar errores)</label>
                 <input name="calle" placeholder="Ej: San Martín">
             </div>
         </div>
-
         <div>
             <label>Número de pedido (opcional)</label>
             <input name="numero_pedido" placeholder="Ej: PED-1001">
         </div>
-
         <div>
             <button type="submit">Consultar</button>
         </div>
@@ -343,6 +334,7 @@ def consulta_cliente() -> str:
     {% elif multiples %}
         <div class="card">
             <h2>Resultados encontrados</h2>
+            <p>No se pudo identificar un único reparto para hoy. Revisá los registros:</p>
             <table>
                 <thead>
                     <tr>
@@ -354,7 +346,6 @@ def consulta_cliente() -> str:
                         <th>Chofer</th>
                         <th>Teléfono</th>
                         <th>Estado</th>
-                        <th>Observaciones</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -368,11 +359,11 @@ def consulta_cliente() -> str:
                         <td>{{ row['chofer_nombre'] or '-' }}</td>
                         <td>{{ row['chofer_telefono'] or '-' }}</td>
                         <td>{{ row['estado'] or '-' }}</td>
-                        <td>{{ row['observaciones'] or '-' }}</td>
                     </tr>
                 {% endfor %}
                 </tbody>
             </table>
+            <p><small>Consejo: para evitar confusiones, pedí apellido + calle o apellido + número de pedido.</small></p>
         </div>
     {% endif %}
     """
@@ -380,18 +371,16 @@ def consulta_cliente() -> str:
 
 
 # =========================
-# Actualizar reparto existente
+# Panel interno
 # =========================
-@app.route("/admin/actualizar_estado/<int:id>", methods=["POST"])
-def actualizar_estado(id):
+@app.route("/admin/actualizar_estado/<int:reparto_id>", methods=["POST"])
+def actualizar_estado(reparto_id: int):
     db = get_db()
-
     nuevo_estado = request.form.get("estado", "").strip()
     va_hoy = 1 if request.form.get("va_hoy") == "on" else 0
-    franja = request.form.get("franja_horaria", "").strip()
-    chofer = request.form.get("chofer_nombre", "").strip()
-    telefono = request.form.get("chofer_telefono", "").strip()
-    observaciones = request.form.get("observaciones", "").strip()
+    franja_horaria = request.form.get("franja_horaria", "").strip()
+    chofer_nombre = request.form.get("chofer_nombre", "").strip()
+    chofer_telefono = request.form.get("chofer_telefono", "").strip()
 
     db.execute(
         """
@@ -400,20 +389,16 @@ def actualizar_estado(id):
             va_hoy = ?,
             franja_horaria = ?,
             chofer_nombre = ?,
-            chofer_telefono = ?,
-            observaciones = ?
+            chofer_telefono = ?
         WHERE id = ?
         """,
-        (nuevo_estado, va_hoy, franja, chofer, telefono, observaciones, id),
+        (nuevo_estado, va_hoy, franja_horaria, chofer_nombre, chofer_telefono, reparto_id),
     )
     db.commit()
-    flash("Reparto actualizado correctamente.")
-    return redirect(url_for("admin", fecha=request.args.get("fecha", "")))
+    flash("Estado del pedido actualizado correctamente.")
+    return redirect(url_for("admin"))
 
 
-# =========================
-# Panel interno
-# =========================
 @app.route("/admin", methods=["GET", "POST"])
 def admin() -> str:
     db = get_db()
@@ -465,7 +450,7 @@ def admin() -> str:
     <div class="topbar">
         <div>
             <h1>Panel interno</h1>
-            <p>Cargá y editá repartos para que los clientes consulten su entrega.</p>
+            <p>Cargá repartos para que los clientes consulten su entrega.</p>
         </div>
         <a class="btn btn-secondary" href="{{ url_for('consulta_cliente') }}">Volver a consulta cliente</a>
     </div>
@@ -531,7 +516,6 @@ def admin() -> str:
                     <option>En preparación</option>
                     <option>En camino</option>
                     <option>Entregado</option>
-                    <option>No entregado</option>
                     <option>Reprogramado</option>
                 </select>
             </div>
@@ -552,7 +536,7 @@ def admin() -> str:
     </form>
 
     <h2>Filtrar repartos por fecha</h2>
-    <form method="get" style="margin-bottom:20px;">
+    <form method="get" style="margin-bottom: 20px;">
         <div class="grid-2">
             <div>
                 <label>Fecha</label>
@@ -560,7 +544,7 @@ def admin() -> str:
             </div>
             <div style="display:flex; align-items:end; gap:10px;">
                 <button type="submit">Filtrar</button>
-                <a class="btn btn-secondary" href="{{ url_for('admin') }}">Limpiar</a>
+                <a class="btn btn-secondary" href="{{ url_for('admin') }}">Limpiar filtro</a>
             </div>
         </div>
     </form>
@@ -573,7 +557,7 @@ def admin() -> str:
                 <th>Cliente</th>
                 <th>Calle</th>
                 <th>Pedido</th>
-                <th>Editar reparto</th>
+                <th>Actualizar</th>
             </tr>
         </thead>
         <tbody>
@@ -584,35 +568,22 @@ def admin() -> str:
                 <td>{{ row['calle'] }}</td>
                 <td>{{ row['numero_pedido'] or '-' }}</td>
                 <td>
-                    <form method="post" action="{{ url_for('actualizar_estado', id=row['id'], fecha=fecha_filtro) }}">
-                        <div class="mini-form">
-                            <label>Estado</label>
+                    <form method="post" action="{{ url_for('actualizar_estado', reparto_id=row['id']) }}">
+                        <div style="display:grid; gap:8px; min-width:260px;">
                             <select name="estado">
                                 <option value="Pendiente" {% if row['estado'] == 'Pendiente' %}selected{% endif %}>Pendiente</option>
                                 <option value="En preparación" {% if row['estado'] == 'En preparación' %}selected{% endif %}>En preparación</option>
                                 <option value="En camino" {% if row['estado'] == 'En camino' %}selected{% endif %}>En camino</option>
                                 <option value="Entregado" {% if row['estado'] == 'Entregado' %}selected{% endif %}>Entregado</option>
-                                <option value="No entregado" {% if row['estado'] == 'No entregado' %}selected{% endif %}>No entregado</option>
                                 <option value="Reprogramado" {% if row['estado'] == 'Reprogramado' %}selected{% endif %}>Reprogramado</option>
                             </select>
-
-                            <label>Franja horaria</label>
-                            <input name="franja_horaria" value="{{ row['franja_horaria'] or '' }}">
-
-                            <label>Chofer</label>
-                            <input name="chofer_nombre" value="{{ row['chofer_nombre'] or '' }}">
-
-                            <label>Teléfono</label>
-                            <input name="chofer_telefono" value="{{ row['chofer_telefono'] or '' }}">
-
+                            <input name="franja_horaria" value="{{ row['franja_horaria'] or '' }}" placeholder="Franja horaria">
+                            <input name="chofer_nombre" value="{{ row['chofer_nombre'] or '' }}" placeholder="Chofer">
+                            <input name="chofer_telefono" value="{{ row['chofer_telefono'] or '' }}" placeholder="Teléfono">
                             <label style="display:flex; gap:8px; align-items:center;">
                                 <input type="checkbox" name="va_hoy" {% if row['va_hoy'] %}checked{% endif %}>
                                 ¿Va hoy?
                             </label>
-
-                            <label>Observación</label>
-                            <textarea name="observaciones" rows="3">{{ row['observaciones'] or '' }}</textarea>
-
                             <button type="submit">Guardar cambios</button>
                         </div>
                     </form>
@@ -622,14 +593,7 @@ def admin() -> str:
         </tbody>
     </table>
     """
-
-    return page(
-        "Panel interno",
-        body,
-        repartos=repartos,
-        hoy=date.today().isoformat(),
-        fecha_filtro=fecha_filtro,
-    )
+    return page("Panel interno", body, repartos=repartos, hoy=date.today().isoformat(), fecha_filtro=fecha_filtro)
 
 
 if __name__ == "__main__":
