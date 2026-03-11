@@ -1403,17 +1403,20 @@ def admin() -> str:
 
     db = get_db()
 
-    mensaje_auto = auto_importar_archivo_si_existe()
-    if mensaje_auto:
-        flash(mensaje_auto)
+    try:
+        mensaje_auto = auto_importar_archivo_si_existe()
+        if mensaje_auto:
+            flash(mensaje_auto)
+    except Exception as exc:
+        flash(f"Error en auto importación: {exc}")
 
-    if GOOGLE_SHEET_URL:
-        try:
+    try:
+        if GOOGLE_SHEET_URL:
             mensaje_gs = importar_desde_google_sheets()
-            if "Se importaron" in mensaje_gs and "0" not in mensaje_gs:
+            if "Se importaron" in mensaje_gs:
                 flash(mensaje_gs)
-        except Exception as exc:
-            flash(f"No se pudo importar Google Sheets: {exc}")
+    except Exception as exc:
+        flash(f"Error en Google Sheets: {exc}")
 
     hoy = date.today().isoformat()
     fecha_filtro = normalizar_texto(request.args.get("fecha")) or hoy
