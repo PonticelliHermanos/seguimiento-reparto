@@ -321,13 +321,106 @@ def optimizar_ruta_simple(paradas: List[sqlite3.Row]) -> List[sqlite3.Row]:
 def leer_excel_o_csv(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
-    return pd.read_excel(path)
 
+    # En este Excel los encabezados reales están en la fila 9
+    return pd.read_excel(path, header=8)
 
 def importar_desde_archivo(path: Path, fuente_automatica: bool = False) -> str:
     df = leer_excel_o_csv(path)
     db = get_db()
     insertados = 0
+
+    df.columns = [str(col).strip() for col in df.columns]
+
+    localidad_actual = ""
+
+    for _, row in df.iterrows():
+        cliente = normalizar_texto(row.get("Cliente"))
+        domicilio = normalizar_texto(row.get("Domicilio Entrega"))
+        telefono = normalizar_texto(row.get("Telefono"))
+        repartidor = normalizar_texto(row.get("Repartidor"))
+        estado_entrega = normalizar_texto(row.get("Estado Entrega"))
+
+        # Detectar filas de localidad
+        if cliente.startswith("Localidad:"):
+            texto = cliente.upper()
+            if "RECONQUISTA" in texto:
+                localidad_actual = "RECONQUISTA"
+            elif "AVELLANEDA" in texto:
+                localidad_actual = "AVELLANEDA"
+            else:
+                localidad_actual = ""
+            continue
+
+        # Ignorar filas vacías o auxiliares
+        if not cliente or cliente.startswith("# Repartos"):
+            continue
+
+        if not domicilio:
+            continue
+
+        fecha_reparto = date.today().isoformat()
+
+        # Evitar duplicados usando cliente + domicilio + fecha
+        existe = db.execute(
+            """
+            SELECT id FROM repartos
+            WHERE apellido = ?
+              AND direccion_completa = ?
+              AND fecha_reparto = ?
+            """,
+            (cliente, domicilio, fecha_reparto),
+        ).fetchone()
+
+        if existe:
+            continue
+
+        estado_final = "En reparto"
+        if "SIN ENTREGAR" in estado_entrega.upper():
+            estado_final = "Sin entregar"
+        elif "EN REPARTO" in estado_entrega.upper():
+            estado_final = "En reparto"
+
+        observaciones = f"Localidad: {localidad_actual}" if localidad_actual else ""
+
+        token = generar_token()
+
+        db.execute(
+            """
+            INSERT INTO repartos (
+                apellido, nombre, calle, direccion_completa, numero_pedido,
+                telefono_cliente, email_cliente, fecha_reparto, va_hoy,
+                franja_horaria, chofer_nombre, chofer_telefono, estado,
+                observaciones, latitud, longitud, orden_ruta,
+                token_seguimiento, importado_desde
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cliente,              # apellido: usamos este campo para guardar cliente completo
+                "",                   # nombre
+                domicilio,            # calle
+                domicilio,            # dirección completa
+                "",                   # número de pedido
+                telefono,             # teléfono cliente
+                "",                   # email cliente
+                fecha_reparto,        # fecha
+                1,                    # va_hoy
+                "",                   # franja horaria
+                repartidor,           # chofer
+                "",                   # teléfono chofer
+                estado_final,         # estado
+                observaciones,        # observaciones
+                None,                 # latitud
+                None,                 # longitud
+                0,                    # orden ruta
+                token,                # token seguimiento
+                path.name if fuente_automatica else "import_manual",
+            ),
+        )
+        insertados += 1
+
+    db.commit()
+    return f"Importación terminada. Se cargaron {insertados} repartos desde {path.name}."
 
     for _, row in df.iterrows():
         apellido = normalizar_texto(row.get("apellido"))
