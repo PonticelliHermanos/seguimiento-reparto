@@ -125,76 +125,6 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE repartos ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
-        total = conn.execute("SELECT COUNT(*) FROM repartos").fetchone()[0]
-        if total == 0:
-            hoy = date.today().isoformat()
-            ejemplos = [
-                (
-                    "García",
-                    "Ana",
-                    "San Martín",
-                    "San Martín 123",
-                    "PED-1001",
-                    "5491155551234",
-                    "",
-                    hoy,
-                    1,
-                    "09:00 a 12:00",
-                    "Carlos Gómez",
-                    "11-5555-1234",
-                    "En preparación",
-                    "Llamar al llegar",
-                    -34.6037,
-                    -58.3816,
-                    1,
-                    secrets.token_urlsafe(16),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-                (
-                    "Pérez",
-                    "Luis",
-                    "Belgrano",
-                    "Belgrano 456",
-                    "PED-1002",
-                    "5491144445678",
-                    "",
-                    hoy,
-                    1,
-                    "14:00 a 17:00",
-                    "Carlos Gómez",
-                    "11-5555-1234",
-                    "Pendiente",
-                    "",
-                    -34.6090,
-                    -58.3920,
-                    2,
-                    secrets.token_urlsafe(16),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            ]
-            conn.executemany(
-                """
-                INSERT INTO repartos (
-                    apellido, nombre, calle, direccion_completa, numero_pedido,
-                    telefono_cliente, email_cliente, fecha_reparto, va_hoy,
-                    franja_horaria, chofer_nombre, chofer_telefono, estado,
-                    observaciones, latitud, longitud, orden_ruta,
-                    token_seguimiento, ultimo_envio, chofer_latitud,
-                    chofer_longitud, chofer_ultima_actualizacion, importado_desde
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                ejemplos,
-            )
-            conn.commit()
-
 
 # =========================
 # Utilidades
@@ -208,7 +138,10 @@ def admin_required():
 def normalizar_texto(valor: Any) -> str:
     if valor is None:
         return ""
-    return str(valor).strip()
+    valor_str = str(valor).strip()
+    if valor_str.lower() == "nan":
+        return ""
+    return valor_str
 
 
 def generar_token() -> str:
@@ -226,8 +159,7 @@ def chofer_url(token: str) -> str:
 def construir_mensaje_cliente(row: sqlite3.Row) -> str:
     return (
         f"Hola {row['nombre'] or row['apellido']}, "
-        f"podés seguir tu pedido {row['numero_pedido'] or ''} acá: "
-        f"{tracking_url(row['token_seguimiento'])}"
+        f"podés seguir tu reparto acá: {tracking_url(row['token_seguimiento'])}"
     )
 
 
@@ -320,10 +252,11 @@ def optimizar_ruta_simple(paradas: List[sqlite3.Row]) -> List[sqlite3.Row]:
 
 def leer_excel_o_csv(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
+        return pd.read_csv(path, dtype=str)
 
-    # En este Excel los encabezados reales están en la fila 9
-    return pd.read_excel(path, header=8)
+    # Tu Excel tiene encabezados reales en la fila 9
+    return pd.read_excel(path, header=8, dtype=str)
+
 
 def importar_desde_archivo(path: Path, fuente_automatica: bool = False) -> str:
     df = leer_excel_o_csv(path)
@@ -340,28 +273,42 @@ def importar_desde_archivo(path: Path, fuente_automatica: bool = False) -> str:
         telefono = normalizar_texto(row.get("Telefono"))
         repartidor = normalizar_texto(row.get("Repartidor"))
         estado_entrega = normalizar_texto(row.get("Estado Entrega"))
+        reparto = normalizar_texto(row.get("Reparto"))
+        nota_venta = normalizar_texto(row.get("Nota Venta"))
+        zona = normalizar_texto(row.get("Zona Reparto"))
+        cobrar = normalizar_texto(row.get("COBRAR"))
+        observaciones_excel = normalizar_texto(row.get("Observaciones"))
 
-        # Detectar filas de localidad
-        if cliente.startswith("Localidad:"):
-            texto = cliente.upper()
-            if "RECONQUISTA" in texto:
+        # Detectar filas auxiliares que anuncian localidad
+        fila_completa = " ".join(
+            normalizar_texto(v) for v in row.values if normalizar_texto(v)
+        ).upper()
+
+        if "LOCALIDAD:" in fila_completa:
+            if "RECONQUISTA" in fila_completa:
                 localidad_actual = "RECONQUISTA"
-            elif "AVELLANEDA" in texto:
+            elif "AVELLANEDA" in fila_completa:
                 localidad_actual = "AVELLANEDA"
             else:
                 localidad_actual = ""
             continue
 
-        # Ignorar filas vacías o auxiliares
-        if not cliente or cliente.startswith("# Repartos"):
+        # Filas no válidas
+        if not cliente:
             continue
-
+        if cliente.startswith("# Repartos"):
+            continue
+        if cliente.upper().startswith("LOCALIDAD:"):
+            continue
         if not domicilio:
             continue
 
         fecha_reparto = date.today().isoformat()
 
-        # Evitar duplicados usando cliente + domicilio + fecha
+        # Identificador
+        numero_pedido = nota_venta if nota_venta else reparto
+
+        # Evitar duplicados
         existe = db.execute(
             """
             SELECT id FROM repartos
@@ -375,13 +322,27 @@ def importar_desde_archivo(path: Path, fuente_automatica: bool = False) -> str:
         if existe:
             continue
 
-        estado_final = "En reparto"
-        if "SIN ENTREGAR" in estado_entrega.upper():
+        estado_upper = estado_entrega.upper()
+        if "SIN ENTREGAR" in estado_upper:
             estado_final = "Sin entregar"
-        elif "EN REPARTO" in estado_entrega.upper():
+        elif "EN REPARTO" in estado_upper:
             estado_final = "En reparto"
+        else:
+            estado_final = estado_entrega if estado_entrega else "Pendiente"
 
-        observaciones = f"Localidad: {localidad_actual}" if localidad_actual else ""
+        observaciones_partes = []
+        if localidad_actual:
+            observaciones_partes.append(f"Localidad: {localidad_actual}")
+        if zona:
+            observaciones_partes.append(f"Zona: {zona}")
+        if cobrar:
+            observaciones_partes.append(f"Cobrar: {cobrar}")
+        if reparto:
+            observaciones_partes.append(f"Reparto: {reparto}")
+        if observaciones_excel:
+            observaciones_partes.append(observaciones_excel)
+
+        observaciones = " | ".join(observaciones_partes)
 
         token = generar_token()
 
@@ -396,84 +357,24 @@ def importar_desde_archivo(path: Path, fuente_automatica: bool = False) -> str:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                cliente,              # apellido: usamos este campo para guardar cliente completo
-                "",                   # nombre
-                domicilio,            # calle
-                domicilio,            # dirección completa
-                "",                   # número de pedido
-                telefono,             # teléfono cliente
-                "",                   # email cliente
-                fecha_reparto,        # fecha
-                1,                    # va_hoy
-                "",                   # franja horaria
-                repartidor,           # chofer
-                "",                   # teléfono chofer
-                estado_final,         # estado
-                observaciones,        # observaciones
-                None,                 # latitud
-                None,                 # longitud
-                0,                    # orden ruta
-                token,                # token seguimiento
-                path.name if fuente_automatica else "import_manual",
-            ),
-        )
-        insertados += 1
-
-    db.commit()
-    return f"Importación terminada. Se cargaron {insertados} repartos desde {path.name}."
-
-    for _, row in df.iterrows():
-        apellido = normalizar_texto(row.get("apellido"))
-        calle = normalizar_texto(row.get("calle"))
-        fecha_reparto = normalizar_texto(row.get("fecha_reparto"))
-
-        if not apellido or not calle or not fecha_reparto:
-            continue
-
-        numero_pedido = normalizar_texto(row.get("numero_pedido"))
-
-        existe = db.execute(
-            """
-            SELECT id FROM repartos
-            WHERE numero_pedido = ?
-              AND fecha_reparto = ?
-            """,
-            (numero_pedido, fecha_reparto),
-        ).fetchone()
-
-        if numero_pedido and existe:
-            continue
-
-        token = generar_token()
-        db.execute(
-            """
-            INSERT INTO repartos (
-                apellido, nombre, calle, direccion_completa, numero_pedido,
-                telefono_cliente, email_cliente, fecha_reparto, va_hoy,
-                franja_horaria, chofer_nombre, chofer_telefono, estado,
-                observaciones, latitud, longitud, orden_ruta,
-                token_seguimiento, importado_desde
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                apellido,
-                normalizar_texto(row.get("nombre")),
-                calle,
-                normalizar_texto(row.get("direccion_completa")),
-                numero_pedido,
-                normalizar_texto(row.get("telefono_cliente")),
-                normalizar_texto(row.get("email_cliente")),
-                fecha_reparto,
-                1 if str(row.get("va_hoy", "")).strip().lower() in {"1", "si", "sí", "true", "x"} else 0,
-                normalizar_texto(row.get("franja_horaria")),
-                normalizar_texto(row.get("chofer_nombre")),
-                normalizar_texto(row.get("chofer_telefono")),
-                normalizar_texto(row.get("estado")) or "Pendiente",
-                normalizar_texto(row.get("observaciones")),
-                float(row.get("latitud")) if pd.notna(row.get("latitud")) else None,
-                float(row.get("longitud")) if pd.notna(row.get("longitud")) else None,
-                int(row.get("orden_ruta")) if pd.notna(row.get("orden_ruta")) else 0,
-                token,
+                cliente,                        # apellido reutilizado como nombre visible del cliente
+                "",                             # nombre
+                domicilio,                      # calle
+                domicilio,                      # direccion completa
+                numero_pedido,                  # numero pedido
+                telefono,                       # telefono cliente
+                "",                             # email
+                fecha_reparto,                  # fecha
+                1,                              # va_hoy
+                "",                             # franja
+                repartidor,                     # chofer
+                "",                             # telefono chofer
+                estado_final,                   # estado
+                observaciones,                  # observaciones
+                None,                           # lat
+                None,                           # lon
+                0,                              # orden
+                token,                          # token
                 path.name if fuente_automatica else "import_manual",
             ),
         )
@@ -502,7 +403,7 @@ def importar_desde_google_sheets() -> str:
     if not GOOGLE_SHEET_URL:
         return "Google Sheets no configurado."
 
-    df = pd.read_csv(GOOGLE_SHEET_URL)
+    df = pd.read_csv(GOOGLE_SHEET_URL, dtype=str)
     db = get_db()
     insertados = 0
 
@@ -757,7 +658,7 @@ def consulta_cliente() -> str:
         hoy = date.today().isoformat()
 
         if not apellido:
-            flash("Ingresá al menos el apellido.")
+            flash("Ingresá al menos el nombre del cliente.")
             return redirect(url_for("consulta_cliente"))
 
         db = get_db()
@@ -800,7 +701,7 @@ def consulta_cliente() -> str:
             <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo empresa">
             <div>
                 <h1>Consulta de reparto</h1>
-                <p>Consultá si tu pedido va hoy y el contacto del chofer.</p>
+                <p>Consultá si tu reparto va hoy y el contacto del repartidor.</p>
             </div>
         </div>
     </div>
@@ -816,18 +717,18 @@ def consulta_cliente() -> str:
     <form method="post">
         <div class="grid-2">
             <div>
-                <label>Apellido</label>
-                <input name="apellido" placeholder="Ej: García" required>
+                <label>Cliente</label>
+                <input name="apellido" placeholder="Ej: GUZMAN EDGARDO" required>
             </div>
             <div>
-                <label>Calle (recomendado)</label>
-                <input name="calle" placeholder="Ej: San Martín">
+                <label>Dirección (recomendado)</label>
+                <input name="calle" placeholder="Ej: 9 DE JULIO 2581">
             </div>
         </div>
 
         <div>
             <label>Número de pedido (opcional)</label>
-            <input name="numero_pedido" placeholder="Ej: PED-1001">
+            <input name="numero_pedido" placeholder="Ej: 000100389652">
         </div>
 
         <div>
@@ -838,8 +739,9 @@ def consulta_cliente() -> str:
     {% if resultado %}
         <div class="card">
             <h2>Resultado</h2>
-            <p><strong>Cliente:</strong> {{ resultado['apellido'] }}, {{ resultado['nombre'] or '-' }}</p>
+            <p><strong>Cliente:</strong> {{ resultado['apellido'] }}</p>
             <p><strong>Pedido:</strong> {{ resultado['numero_pedido'] or '-' }}</p>
+            <p><strong>Dirección:</strong> {{ resultado['direccion_completa'] or resultado['calle'] }}</p>
             <p><strong>Fecha de reparto:</strong> {{ resultado['fecha_reparto'] }}</p>
             <p><strong>¿Va hoy?:</strong>
                 {% if resultado['va_hoy'] %}
@@ -848,9 +750,7 @@ def consulta_cliente() -> str:
                     <span class="no">No</span>
                 {% endif %}
             </p>
-            <p><strong>Franja horaria:</strong> {{ resultado['franja_horaria'] or '-' }}</p>
-            <p><strong>Chofer:</strong> {{ resultado['chofer_nombre'] or '-' }}</p>
-            <p><strong>Teléfono del chofer:</strong> {{ resultado['chofer_telefono'] or '-' }}</p>
+            <p><strong>Repartidor:</strong> {{ resultado['chofer_nombre'] or '-' }}</p>
             <p><strong>Estado:</strong> {{ resultado['estado'] or '-' }}</p>
             <p><strong>Observaciones:</strong> {{ resultado['observaciones'] or '-' }}</p>
         </div>
@@ -862,11 +762,9 @@ def consulta_cliente() -> str:
                     <tr>
                         <th>Fecha</th>
                         <th>Cliente</th>
-                        <th>Calle</th>
+                        <th>Dirección</th>
                         <th>Pedido</th>
-                        <th>¿Va hoy?</th>
-                        <th>Chofer</th>
-                        <th>Teléfono</th>
+                        <th>Repartidor</th>
                         <th>Estado</th>
                         <th>Observaciones</th>
                     </tr>
@@ -875,12 +773,10 @@ def consulta_cliente() -> str:
                 {% for row in multiples %}
                     <tr>
                         <td>{{ row['fecha_reparto'] }}</td>
-                        <td>{{ row['apellido'] }}, {{ row['nombre'] or '-' }}</td>
-                        <td>{{ row['calle'] }}</td>
+                        <td>{{ row['apellido'] }}</td>
+                        <td>{{ row['direccion_completa'] or row['calle'] }}</td>
                         <td>{{ row['numero_pedido'] or '-' }}</td>
-                        <td>{{ 'Sí' if row['va_hoy'] else 'No' }}</td>
                         <td>{{ row['chofer_nombre'] or '-' }}</td>
-                        <td>{{ row['chofer_telefono'] or '-' }}</td>
                         <td>{{ row['estado'] or '-' }}</td>
                         <td>{{ row['observaciones'] or '-' }}</td>
                     </tr>
@@ -955,23 +851,22 @@ def seguimiento_cliente(token: str) -> str:
         <div class="brand">
             <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo empresa">
             <div>
-                <h1>Seguimiento de pedido</h1>
+                <h1>Seguimiento de reparto</h1>
                 <p>Estado actualizado del reparto.</p>
             </div>
         </div>
     </div>
 
     <div class="card">
-        <p><strong>Cliente:</strong> {{ row['apellido'] }}, {{ row['nombre'] or '-' }}</p>
+        <p><strong>Cliente:</strong> {{ row['apellido'] }}</p>
         <p><strong>Pedido:</strong> {{ row['numero_pedido'] or '-' }}</p>
+        <p><strong>Dirección:</strong> {{ row['direccion_completa'] or row['calle'] }}</p>
         <p><strong>Fecha:</strong> {{ row['fecha_reparto'] }}</p>
         <p><strong>Estado:</strong> {{ row['estado'] or '-' }}</p>
-        <p><strong>Franja:</strong> {{ row['franja_horaria'] or '-' }}</p>
-        <p><strong>Chofer:</strong> {{ row['chofer_nombre'] or '-' }}</p>
-        <p><strong>Teléfono chofer:</strong> {{ row['chofer_telefono'] or '-' }}</p>
+        <p><strong>Repartidor:</strong> {{ row['chofer_nombre'] or '-' }}</p>
         <p><strong>Observaciones:</strong> {{ row['observaciones'] or '-' }}</p>
         {% if row['chofer_latitud'] and row['chofer_longitud'] %}
-            <p><strong>Ubicación estimada del chofer:</strong> actualizada {{ row['chofer_ultima_actualizacion'] or '-' }}</p>
+            <p><strong>Ubicación estimada del repartidor:</strong> actualizada {{ row['chofer_ultima_actualizacion'] or '-' }}</p>
             <div id="map"></div>
             <script>
                 const map = L.map('map').setView([{{ row['chofer_latitud'] }}, {{ row['chofer_longitud'] }}], 14);
@@ -979,7 +874,7 @@ def seguimiento_cliente(token: str) -> str:
                     attribution: '&copy; OpenStreetMap'
                 }).addTo(map);
                 L.marker([{{ row['chofer_latitud'] }}, {{ row['chofer_longitud'] }}]).addTo(map)
-                    .bindPopup('Chofer en ruta');
+                    .bindPopup('Repartidor en ruta');
             </script>
         {% endif %}
     </div>
@@ -988,7 +883,7 @@ def seguimiento_cliente(token: str) -> str:
 
 
 # =========================
-# Vista chofer + GPS
+# Vista chofer
 # =========================
 @app.route("/chofer/<token>", methods=["GET", "POST"])
 def vista_chofer(token: str) -> str:
@@ -1032,7 +927,7 @@ def vista_chofer(token: str) -> str:
         <div class="brand">
             <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo empresa">
             <div>
-                <h1>Panel chofer</h1>
+                <h1>Panel repartidor</h1>
                 <p>Actualización rápida del reparto.</p>
             </div>
         </div>
@@ -1047,19 +942,18 @@ def vista_chofer(token: str) -> str:
     {% endwith %}
 
     <div class="card">
-        <p><strong>Cliente:</strong> {{ row['apellido'] }}, {{ row['nombre'] or '-' }}</p>
+        <p><strong>Cliente:</strong> {{ row['apellido'] }}</p>
         <p><strong>Pedido:</strong> {{ row['numero_pedido'] or '-' }}</p>
         <p><strong>Dirección:</strong> {{ row['direccion_completa'] or row['calle'] }}</p>
         <p><strong>Estado actual:</strong> {{ row['estado'] or '-' }}</p>
     </div>
 
-    <form method="post" id="formChofer">
+    <form method="post">
         <label>Estado</label>
         <select name="estado">
-            <option value="En camino" {% if row['estado'] == 'En camino' %}selected{% endif %}>En camino</option>
+            <option value="En reparto" {% if row['estado'] == 'En reparto' %}selected{% endif %}>En reparto</option>
             <option value="Entregado" {% if row['estado'] == 'Entregado' %}selected{% endif %}>Entregado</option>
-            <option value="No entregado" {% if row['estado'] == 'No entregado' %}selected{% endif %}>No entregado</option>
-            <option value="Reprogramado" {% if row['estado'] == 'Reprogramado' %}selected{% endif %}>Reprogramado</option>
+            <option value="Sin entregar" {% if row['estado'] == 'Sin entregar' %}selected{% endif %}>Sin entregar</option>
         </select>
 
         <label>Observaciones</label>
@@ -1078,15 +972,13 @@ def vista_chofer(token: str) -> str:
         <form method="post" style="display:inline;">
             <input type="hidden" name="estado" value="Entregado">
             <input type="hidden" name="observaciones" value="{{ row['observaciones'] or '' }}">
-            <input type="hidden" name="chofer_latitud" id="entrega_lat">
-            <input type="hidden" name="chofer_longitud" id="entrega_lon">
-            <button class="btn btn-success" type="submit" onclick="llenarEntregaCoords()">Marcar entregado</button>
+            <button class="btn btn-success" type="submit">Marcar entregado</button>
         </form>
 
         <form method="post" style="display:inline;">
-            <input type="hidden" name="estado" value="No entregado">
-            <input type="hidden" name="observaciones" value="Cliente ausente">
-            <button class="btn btn-danger" type="submit">No entregado</button>
+            <input type="hidden" name="estado" value="Sin entregar">
+            <input type="hidden" name="observaciones" value="Sin entregar">
+            <button class="btn btn-danger" type="submit">Sin entregar</button>
         </form>
     </div>
 
@@ -1104,19 +996,9 @@ def vista_chofer(token: str) -> str:
                 alert('No se pudo obtener la ubicación');
             });
         }
-
-        function llenarEntregaCoords() {
-            if (!navigator.geolocation) {
-                return;
-            }
-            navigator.geolocation.getCurrentPosition(function(pos) {
-                document.getElementById('entrega_lat').value = pos.coords.latitude;
-                document.getElementById('entrega_lon').value = pos.coords.longitude;
-            });
-        }
     </script>
     """
-    return page("Panel chofer", body, row=row)
+    return page("Panel repartidor", body, row=row)
 
 
 # =========================
@@ -1174,11 +1056,10 @@ def importar_excel():
 
     try:
         mensaje = importar_desde_archivo(destino)
+        flash(mensaje)
     except Exception as exc:
         flash(f"No se pudo leer el archivo: {exc}")
-        return redirect(url_for("admin"))
 
-    flash(mensaje)
     return redirect(url_for("admin"))
 
 
@@ -1209,7 +1090,7 @@ def optimizar_ruta():
     fecha = normalizar_texto(request.form.get("fecha")) or date.today().isoformat()
     chofer = normalizar_texto(request.form.get("chofer"))
     if not chofer:
-        flash("Elegí un chofer.")
+        flash("Elegí un repartidor.")
         return redirect(url_for("admin", fecha=fecha))
 
     db = get_db()
@@ -1306,7 +1187,7 @@ def mapa_chofer() -> str:
 
     db = get_db()
     if not chofer:
-        flash("Elegí un chofer para ver el mapa.")
+        flash("Elegí un repartidor para ver el mapa.")
         return redirect(url_for("admin", fecha=fecha))
 
     rows = db.execute(
@@ -1322,7 +1203,7 @@ def mapa_chofer() -> str:
         (fecha, chofer),
     ).fetchall()
 
-    puntos = [{"lat": row["latitud"], "lon": row["longitud"]} for row in rows]
+    puntos = [{"lat": float(row["latitud"]), "lon": float(row["longitud"])} for row in rows if row["latitud"] and row["longitud"]]
     ruta = obtener_ruta_osrm(puntos)
 
     body = """
@@ -1331,7 +1212,7 @@ def mapa_chofer() -> str:
             <img src="{{ url_for('static', filename='logo.png') }}" alt="Logo empresa">
             <div>
                 <h1>Mapa de ruta</h1>
-                <p>Chofer: <strong>{{ chofer }}</strong> | Fecha: <strong>{{ fecha }}</strong></p>
+                <p>Repartidor: <strong>{{ chofer }}</strong> | Fecha: <strong>{{ fecha }}</strong></p>
             </div>
         </div>
         <a class="btn btn-secondary" href="{{ url_for('admin', fecha=fecha, chofer=chofer) }}">Volver al panel</a>
@@ -1339,7 +1220,7 @@ def mapa_chofer() -> str:
 
     {% if not rows %}
         <div class="card">
-            <p>No hay puntos con latitud/longitud para este chofer y fecha.</p>
+            <p>No hay puntos con latitud/longitud para este repartidor y fecha.</p>
         </div>
     {% else %}
         <div id="map"></div>
@@ -1359,26 +1240,26 @@ def mapa_chofer() -> str:
                     .bindPopup(
                         '<b>Parada ' + (index + 1) + '</b><br>' +
                         stop.cliente + '<br>' +
-                        (stop.direccion || '') + '<br>' +
-                        'Pedido: ' + (stop.pedido || '-')
+                        (stop.direccion || '')
                     );
             });
 
-            const poly = L.polyline(routeCoords, {weight: 5}).addTo(map);
-            map.fitBounds(poly.getBounds());
+            if (routeCoords.length > 0) {
+                const poly = L.polyline(routeCoords, {weight: 5}).addTo(map);
+                map.fitBounds(poly.getBounds());
+            }
         </script>
     {% endif %}
     """
 
     stops = [
         {
-            "lat": row["latitud"],
-            "lon": row["longitud"],
-            "cliente": f"{row['apellido']}, {row['nombre'] or ''}",
+            "lat": float(row["latitud"]),
+            "lon": float(row["longitud"]),
+            "cliente": f"{row['apellido']}",
             "direccion": row["direccion_completa"] or row["calle"],
-            "pedido": row["numero_pedido"] or "",
         }
-        for row in rows
+        for row in rows if row["latitud"] and row["longitud"]
     ]
 
     return page(
@@ -1447,7 +1328,7 @@ def admin() -> str:
         )
 
         if not datos[0] or not datos[2] or not datos[7]:
-            flash("Apellido, calle y fecha de reparto son obligatorios.")
+            flash("Cliente, dirección y fecha de reparto son obligatorios.")
             return redirect(url_for("admin", fecha=fecha_filtro, chofer=chofer_filtro, estado=estado_filtro))
 
         db.execute(
@@ -1483,7 +1364,7 @@ def admin() -> str:
         "SELECT DISTINCT chofer_nombre FROM repartos WHERE chofer_nombre IS NOT NULL AND chofer_nombre != '' ORDER BY chofer_nombre ASC"
     ).fetchall()
 
-    estados = ["Pendiente", "En preparación", "En camino", "Entregado", "No entregado", "Reprogramado"]
+    estados = ["Pendiente", "En reparto", "Entregado", "Sin entregar"]
 
     body = """
     <div class="topbar">
@@ -1497,7 +1378,7 @@ def admin() -> str:
         <div class="actions">
             <a class="btn btn-secondary" href="{{ url_for('admin_logout') }}">Salir</a>
             {% if chofer_filtro %}
-                <a class="btn btn-secondary" href="{{ url_for('mapa_chofer', fecha=fecha_filtro, chofer=chofer_filtro) }}">Ver mapa del chofer</a>
+                <a class="btn btn-secondary" href="{{ url_for('mapa_chofer', fecha=fecha_filtro, chofer=chofer_filtro) }}">Ver mapa del repartidor</a>
             {% endif %}
         </div>
     </div>
@@ -1520,11 +1401,11 @@ def admin() -> str:
         <form method="post">
             <div class="grid-3">
                 <div>
-                    <label>Apellido *</label>
+                    <label>Cliente *</label>
                     <input name="apellido" required>
                 </div>
                 <div>
-                    <label>Nombre</label>
+                    <label>Nombre adicional</label>
                     <input name="nombre">
                 </div>
                 <div>
@@ -1535,7 +1416,7 @@ def admin() -> str:
 
             <div class="grid-3">
                 <div>
-                    <label>Calle *</label>
+                    <label>Dirección *</label>
                     <input name="calle" required>
                 </div>
                 <div>
@@ -1565,11 +1446,11 @@ def admin() -> str:
 
             <div class="grid-3">
                 <div>
-                    <label>Chofer</label>
+                    <label>Repartidor</label>
                     <input name="chofer_nombre">
                 </div>
                 <div>
-                    <label>Teléfono chofer</label>
+                    <label>Teléfono repartidor</label>
                     <input name="chofer_telefono">
                 </div>
                 <div>
@@ -1615,7 +1496,6 @@ def admin() -> str:
 
     <div class="card">
         <h2>Importar desde Excel o CSV</h2>
-        <p>Columnas sugeridas: <code>apellido, nombre, calle, direccion_completa, numero_pedido, telefono_cliente, email_cliente, fecha_reparto, va_hoy, franja_horaria, chofer_nombre, chofer_telefono, estado, observaciones, latitud, longitud, orden_ruta</code></p>
         <form method="post" action="{{ url_for('importar_excel') }}" enctype="multipart/form-data">
             <input type="file" name="archivo_excel" accept=".xlsx,.xls,.csv" required>
             <button type="submit">Importar archivo</button>
@@ -1624,7 +1504,6 @@ def admin() -> str:
 
     <div class="card">
         <h2>Importar desde Google Sheets</h2>
-        <p>Trae repartos desde una planilla publicada como CSV.</p>
         <form method="post" action="{{ url_for('importar_google_sheets_manual') }}">
             <button type="submit">Importar ahora</button>
         </form>
@@ -1639,7 +1518,7 @@ def admin() -> str:
                     <input type="date" name="fecha" value="{{ fecha_filtro }}">
                 </div>
                 <div>
-                    <label>Chofer</label>
+                    <label>Repartidor</label>
                     <select name="chofer">
                         <option value="">Todos</option>
                         {% for ch in choferes %}
@@ -1678,7 +1557,8 @@ def admin() -> str:
             <tr>
                 <th>Fecha</th>
                 <th>Cliente</th>
-                <th>Pedido</th>
+                <th>Dirección</th>
+                <th>Repartidor</th>
                 <th>Editar reparto</th>
             </tr>
         </thead>
@@ -1686,11 +1566,9 @@ def admin() -> str:
         {% for row in repartos %}
             <tr>
                 <td>{{ row['fecha_reparto'] }}</td>
-                <td>
-                    <strong>{{ row['apellido'] }}, {{ row['nombre'] or '-' }}</strong><br>
-                    {{ row['direccion_completa'] or row['calle'] }}
-                </td>
-                <td>{{ row['numero_pedido'] or '-' }}</td>
+                <td>{{ row['apellido'] }}</td>
+                <td>{{ row['direccion_completa'] or row['calle'] }}</td>
+                <td>{{ row['chofer_nombre'] or '-' }}</td>
                 <td>
                     <form method="post" action="{{ url_for('actualizar_reparto', id=row['id'], fecha=fecha_filtro, chofer=chofer_filtro, estado=estado_filtro) }}">
                         <div class="mini-form">
@@ -1701,14 +1579,8 @@ def admin() -> str:
                                 {% endfor %}
                             </select>
 
-                            <label>Franja horaria</label>
-                            <input name="franja_horaria" value="{{ row['franja_horaria'] or '' }}">
-
-                            <label>Chofer</label>
+                            <label>Repartidor</label>
                             <input name="chofer_nombre" value="{{ row['chofer_nombre'] or '' }}">
-
-                            <label>Teléfono chofer</label>
-                            <input name="chofer_telefono" value="{{ row['chofer_telefono'] or '' }}">
 
                             <label>Teléfono cliente</label>
                             <input name="telefono_cliente" value="{{ row['telefono_cliente'] or '' }}">
@@ -1735,10 +1607,13 @@ def admin() -> str:
                             <label>Observación</label>
                             <textarea name="observaciones" rows="3">{{ row['observaciones'] or '' }}</textarea>
 
+                            <input type="hidden" name="franja_horaria" value="{{ row['franja_horaria'] or '' }}">
+                            <input type="hidden" name="chofer_telefono" value="{{ row['chofer_telefono'] or '' }}">
+
                             <div class="actions">
                                 <button type="submit">Guardar cambios</button>
                                 <a class="btn btn-secondary" href="{{ url_for('seguimiento_cliente', token=row['token_seguimiento']) }}" target="_blank">Ver seguimiento</a>
-                                <a class="btn btn-warning" href="{{ url_for('vista_chofer', token=row['token_seguimiento']) }}" target="_blank">Vista chofer</a>
+                                <a class="btn btn-warning" href="{{ url_for('vista_chofer', token=row['token_seguimiento']) }}" target="_blank">Vista repartidor</a>
 
                                 {% if row['telefono_cliente'] %}
                                     <a class="btn btn-success"
@@ -1758,9 +1633,9 @@ def admin() -> str:
 
                             <small class="small">
                                 Seguimiento: {{ tracking_url(row['token_seguimiento']) }}<br>
-                                Chofer: {{ chofer_url(row['token_seguimiento']) }}<br>
+                                Repartidor: {{ chofer_url(row['token_seguimiento']) }}<br>
                                 Último envío: {{ row['ultimo_envio'] or 'Nunca' }}<br>
-                                GPS chofer: {{ row['chofer_ultima_actualizacion'] or 'Sin datos' }}
+                                GPS repartidor: {{ row['chofer_ultima_actualizacion'] or 'Sin datos' }}
                             </small>
                         </div>
                     </form>
