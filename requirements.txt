@@ -1,2 +1,6 @@
 Flask
+pandas
+openpyxl
+requests
+twilio
 gunicorn
